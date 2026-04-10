@@ -80,6 +80,12 @@ MOIS = {
     "jul":7, "aug":8, "sep":9, "oct":10,"nov":11,"dec":12,
 }
 
+MOIS_EN = {
+    1:"january", 2:"february", 3:"march",    4:"april",
+    5:"may",     6:"june",     7:"july",     8:"august",
+    9:"september",10:"october",11:"november",12:"december",
+}
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logs
@@ -146,68 +152,39 @@ def get_metar() -> Optional[float]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Polymarket — Gamma API
+# Polymarket — Gamma API (slug direct)
 # ─────────────────────────────────────────────────────────────────────────────
-def chercher_marches_paris() -> list:
-    """Cherche les marchés température Paris actifs sur Polymarket."""
+def slug_paris(date_str: str) -> str:
+    """
+    Construit le slug Polymarket pour Paris à une date donnée.
+    Ex: 2026-04-13 → 'highest-temperature-in-paris-on-april-13-2026'
+    """
+    dt   = datetime.strptime(date_str, "%Y-%m-%d")
+    mois = MOIS_EN[dt.month]
+    return f"highest-temperature-in-paris-on-{mois}-{dt.day}-{dt.year}"
+
+
+def fetch_event_paris(date_str: str) -> Optional[dict]:
+    """Récupère l'événement Polymarket Paris pour une date précise via son slug."""
+    slug = slug_paris(date_str)
     try:
-        params = {
-            "q":      "Paris temperature",
-            "active": "true",
-            "closed": "false",
-            "limit":  50,
-        }
-        r = requests.get(f"{GAMMA_URL}/markets", params=params, timeout=(5, 12)).json()
-        marches = r if isinstance(r, list) else r.get("markets", [])
-
-        resultats = []
-        for m in marches:
-            q = (m.get("question") or "").lower()
-            if "paris" in q and any(
-                kw in q for kw in ["temperature", "temp", "highest", "°c", "celsius"]
-            ):
-                resultats.append(m)
-        return resultats
+        r = requests.get(
+            f"{GAMMA_URL}/events",
+            params={"slug": slug},
+            timeout=(5, 12),
+        ).json()
+        events = r if isinstance(r, list) else r.get("events", [])
+        if events:
+            log(f"Paris {date_str} : événement trouvé ({slug})")
+            return events[0]
+        log(f"Paris {date_str} : aucun événement ({slug})")
     except Exception as e:
-        log(f"Polymarket search erreur : {e}", "ERR")
-        return []
-
-
-def parse_date_marche(marche: dict) -> Optional[str]:
-    """Extrait la date cible (YYYY-MM-DD) depuis la question ou endDate."""
-    question = marche.get("question", "")
-
-    # Ex: "Highest temperature in Paris on March 20?"
-    m = re.search(
-        r"on\s+(\w+)\s+(\d{1,2})(?:,?\s*(\d{4}))?",
-        question,
-        re.IGNORECASE,
-    )
-    if m:
-        mois_str = m.group(1).lower()
-        jour     = int(m.group(2))
-        annee    = int(m.group(3)) if m.group(3) else datetime.now(timezone.utc).year
-        num_mois = MOIS.get(mois_str)
-        if num_mois:
-            try:
-                return datetime(annee, num_mois, jour).strftime("%Y-%m-%d")
-            except ValueError:
-                pass
-
-    # Fallback : endDate − 1 jour
-    end = marche.get("endDate") or marche.get("end_date_iso")
-    if end:
-        try:
-            dt = datetime.fromisoformat(end.replace("Z", "+00:00"))
-            return (dt - timedelta(days=1)).strftime("%Y-%m-%d")
-        except Exception:
-            pass
-
+        log(f"Erreur fetch Paris {date_str} : {e}", "ERR")
     return None
 
 
 def heures_restantes(marche: dict) -> float:
-    """Nombre d'heures avant clôture du marché."""
+    """Nombre d'heures avant clôture d'un marché."""
     end = marche.get("endDate") or marche.get("end_date_iso")
     if not end:
         return 999.0
@@ -219,34 +196,80 @@ def heures_restantes(marche: dict) -> float:
         return 999.0
 
 
-def parser_buckets(marche: dict) -> list:
-    """Parse les outcomes (buckets de température) et leurs prix."""
-    outcomes = marche.get("outcomes")
-    prices   = marche.get("outcomePrices")
-    tokens   = marche.get("tokens") or []
+def extraire_nom_bucket(question: str) -> str:
+    """
+    Extrait le nom du bucket depuis la question d'un marché Yes/No.
+    Ex: '...be between 10°C and 14°C?' → '10-14°C'
+    Ex: '...be above 20°C?'            → 'above 20°C'
+    Ex: '...be below 5°C?'             → 'below 5°C'
+    """
+    q = question
 
-    if isinstance(outcomes, str):
-        try:
-            outcomes = json.loads(outcomes)
-        except Exception:
-            outcomes = []
-    if isinstance(prices, str):
-        try:
-            prices = json.loads(prices)
-        except Exception:
-            prices = []
+    m = re.search(r"between\s+([-\d.]+)°?C?\s+and\s+([-\d.]+)°?C", q, re.IGNORECASE)
+    if m:
+        return f"{m.group(1)}-{m.group(2)}°C"
 
+    m = re.search(r"(?:above|over)\s+([-\d.]+)°?C", q, re.IGNORECASE)
+    if m:
+        return f"above {m.group(1)}°C"
+
+    m = re.search(r"(?:below|under)\s+([-\d.]+)°?C", q, re.IGNORECASE)
+    if m:
+        return f"below {m.group(1)}°C"
+
+    # Fallback : retourne la question brute tronquée
+    return question[:60]
+
+
+def parser_buckets_event(markets: list) -> list:
+    """
+    Parse les buckets depuis un événement Polymarket composé de marchés Yes/No.
+    Chaque marché représente un bucket de température.
+    Retourne le prix YES de chaque bucket.
+    """
     buckets = []
-    for i, (nom, prix) in enumerate(zip(outcomes or [], prices or [])):
-        try:
-            token_id = tokens[i]["token_id"] if i < len(tokens) else None
-            buckets.append({
-                "nom":      nom,
-                "prix":     float(prix),
-                "token_id": token_id,
-            })
-        except Exception:
-            pass
+    for m in markets:
+        question = m.get("question", "")
+        outcomes = m.get("outcomes") or []
+        prices   = m.get("outcomePrices") or []
+        tokens   = m.get("tokens") or []
+
+        if isinstance(outcomes, str):
+            try:
+                outcomes = json.loads(outcomes)
+            except Exception:
+                outcomes = []
+        if isinstance(prices, str):
+            try:
+                prices = json.loads(prices)
+            except Exception:
+                prices = []
+
+        yes_prix     = None
+        yes_token_id = None
+
+        for i, (outcome, prix) in enumerate(zip(outcomes, prices)):
+            if str(outcome).lower() == "yes":
+                try:
+                    yes_prix = float(prix)
+                except Exception:
+                    pass
+                yes_token_id = tokens[i]["token_id"] if i < len(tokens) else None
+                break
+
+        if yes_prix is None:
+            continue
+
+        nom = extraire_nom_bucket(question)
+        buckets.append({
+            "nom":       nom,
+            "prix":      yes_prix,
+            "token_id":  yes_token_id,
+            "market_id": m.get("id") or m.get("conditionId"),
+            "volume":    float(m.get("volume") or 0),
+            "heures":    heures_restantes(m),
+        })
+
     return buckets
 
 
@@ -553,28 +576,25 @@ def tenter_resolution(mkt: dict) -> bool:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Traitement d'un marché individuel
+# Traitement d'un événement Paris (date par date)
 # ─────────────────────────────────────────────────────────────────────────────
-def traiter_marche(marche: dict, ecmwf: dict, metar_temp: Optional[float], etat: dict):
-    mid      = marche.get("id") or marche.get("conditionId") or ""
-    question = marche.get("question", "")
-
-    date_str = parse_date_marche(marche)
-    if not date_str:
+def traiter_event(event: dict, date_str: str, ecmwf: dict,
+                  metar_temp: Optional[float], etat: dict):
+    """
+    Analyse un événement Polymarket Paris pour une date donnée.
+    L'événement contient N marchés Yes/No, un par bucket de température.
+    """
+    markets = event.get("markets") or []
+    if not markets:
+        log(f"Paris {date_str} : événement sans marchés")
         return
 
-    heures = heures_restantes(marche)
-    if heures < MIN_HEURES or heures > MAX_HEURES:
-        return
+    # Charger ou créer le record local
+    question = event.get("title") or event.get("question") or f"Paris {date_str}"
+    event_id = str(event.get("id") or "")
+    mkt = charger_marche(date_str) or nouveau_marche(date_str, event_id, question)
 
-    volume = float(marche.get("volume") or 0)
-    if volume < MIN_VOLUME:
-        log(f"Paris {date_str} : skip (volume {volume:.0f}$ < {MIN_VOLUME}$)")
-        return
-
-    mkt = charger_marche(date_str) or nouveau_marche(date_str, mid, question)
-
-    # Déjà positionné sur ce marché
+    # Déjà positionné
     if mkt.get("position"):
         return
 
@@ -584,32 +604,43 @@ def traiter_marche(marche: dict, ecmwf: dict, metar_temp: Optional[float], etat:
         sauver_marche(mkt)
         return
 
+    # Parse tous les buckets depuis les marchés Yes/No de l'événement
+    buckets = parser_buckets_event(markets)
+    if not buckets:
+        log(f"Paris {date_str} : aucun bucket parseable", "WARN")
+        sauver_marche(mkt)
+        return
+
+    # Filtres sur les buckets (heures, volume)
+    buckets_valides = [
+        b for b in buckets
+        if MIN_HEURES <= b["heures"] <= MAX_HEURES and b["volume"] >= MIN_VOLUME
+    ]
+    if not buckets_valides:
+        log(f"Paris {date_str} : buckets filtrés (heures/volume hors limites)")
+        sauver_marche(mkt)
+        return
+
     # Snapshot forecast
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     mkt["forecast_snapshots"].append({
         "ts":      datetime.now(timezone.utc).isoformat(),
-        "heures":  round(heures, 1),
+        "heures":  round(buckets_valides[0]["heures"], 1),
         "ecmwf":   prevision,
         "metar":   metar_temp if date_str == today_str else None,
     })
 
-    buckets = parser_buckets(marche)
-    if not buckets:
-        sauver_marche(mkt)
-        return
-
     # Snapshot marché
     mkt["marche_snapshots"].append({
         "ts":      datetime.now(timezone.utc).isoformat(),
-        "buckets": [{"nom": b["nom"], "prix": b["prix"]} for b in buckets],
-        "volume":  volume,
-        "heures":  round(heures, 1),
+        "buckets": [{"nom": b["nom"], "prix": b["prix"]} for b in buckets_valides],
+        "heures":  round(buckets_valides[0]["heures"], 1),
     })
 
-    # Bucket cible
-    cible = bucket_pour_temp(prevision, buckets)
+    # Bucket correspondant à la prévision
+    cible = bucket_pour_temp(prevision, buckets_valides)
     if not cible:
-        log(f"Paris {date_str} : pas de bucket pour {prevision}°C", "WARN")
+        log(f"Paris {date_str} : pas de bucket pour {prevision}°C | buckets={[b['nom'] for b in buckets_valides]}", "WARN")
         sauver_marche(mkt)
         return
 
@@ -622,7 +653,7 @@ def traiter_marche(marche: dict, ecmwf: dict, metar_temp: Optional[float], etat:
     # Prix d'entrée = ask (mid + slippage)
     ask = min(prix_mid + MAX_SLIPPAGE, 0.99)
 
-    # Probabilité (distribution normale)
+    # Probabilité via distribution normale
     sigma = get_sigma()
     p     = prob_bucket(prevision, cible, sigma)
 
@@ -638,21 +669,23 @@ def traiter_marche(marche: dict, ecmwf: dict, metar_temp: Optional[float], etat:
         return
 
     # Kelly sizing
-    k      = calc_kelly(p, ask)
+    k       = calc_kelly(p, ask)
     montant = taille_mise(k, etat["balance"])
     if montant < 0.50:
         sauver_marche(mkt)
         return
 
-    # Placement ordre
+    # Placement ordre — on utilise le market_id du bucket cible pour la résolution
     order_id = placer_ordre(cible.get("token_id"), ask, montant)
     if not order_id:
         sauver_marche(mkt)
         return
 
+    mkt["market_id"] = cible.get("market_id") or event_id  # marché Yes/No du bucket
     mkt["position"] = {
         "bucket":    cible["nom"],
         "token_id":  cible.get("token_id"),
+        "market_id": cible.get("market_id"),
         "prix":      ask,
         "montant":   montant,
         "order_id":  order_id,
@@ -699,15 +732,14 @@ def scan():
     log(f"ECMWF : {ecmwf}")
     log(f"METAR LFPG : {metar_temp}°C" if metar_temp else "METAR : indisponible")
 
-    # 2. Marchés Paris actifs
-    marches = chercher_marches_paris()
-    log(f"{len(marches)} marché(s) Paris trouvé(s)")
-
-    for marche in marches:
+    # 2. Événements Paris — un slug par date
+    for date_str in dates:
         try:
-            traiter_marche(marche, ecmwf, metar_temp, etat)
+            event = fetch_event_paris(date_str)
+            if event:
+                traiter_event(event, date_str, ecmwf, metar_temp, etat)
         except Exception as e:
-            log(f"Erreur marché {marche.get('id', '?')} : {e}", "ERR")
+            log(f"Erreur Paris {date_str} : {e}", "ERR")
             traceback.print_exc()
 
     # 3. Résolution automatique des positions ouvertes
